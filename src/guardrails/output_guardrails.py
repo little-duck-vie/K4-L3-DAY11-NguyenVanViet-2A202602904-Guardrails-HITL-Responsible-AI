@@ -4,6 +4,7 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
 import re
 import textwrap
 
@@ -12,7 +13,26 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+
+def _compact_secret_text(text: str) -> str:
+    """Collapse separators so spaced/obfuscated lab secrets are still detected."""
+    return re.sub(r"[^a-zA-Z0-9]", "", text or "").lower()
+
+
+def _known_secret_variants() -> list[str]:
+    variants: list[str] = []
+    for secret in DEMO_SECRETS:
+        if not secret:
+            continue
+        variants.append(secret)
+        try:
+            variants.append(base64.b64encode(secret.encode("utf-8")).decode("ascii"))
+        except Exception:
+            pass
+    return variants
 
 
 # ============================================================
@@ -41,12 +61,12 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "vn_phone": r"(?<!\d)(?:\+?84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+        "email": r"\b[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+        "national_id": r"\b(?:\d{9}|\d{12})\b",
+        "api_key": r"\bsk-[a-zA-Z0-9][a-zA-Z0-9_-]{5,}\b",
+        "password": r"\b(?:admin\s+)?password\s*(?:is|=|:)\s*['\"]?[^\s,'\".]+",
+        "internal_host": r"\b[a-zA-Z0-9.-]+\.internal(?::\d+)?\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +74,19 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    compact_redacted = _compact_secret_text(redacted)
+    leaked_variants = [
+        variant
+        for variant in _known_secret_variants()
+        if _compact_secret_text(variant)
+        and _compact_secret_text(variant) in compact_redacted
+    ]
+    if leaked_variants:
+        issues.append(f"protected_secret: {len(leaked_variants)} found")
+        redacted = (
+            "I cannot share internal system details or protected values. [REDACTED]"
+        )
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +205,34 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        current_text = response_text
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            current_text = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=current_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(current_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot share that response safely. "
+                                "Please ask a VinBank banking question without "
+                                "requesting private data or internal details."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
